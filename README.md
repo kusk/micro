@@ -3,7 +3,7 @@
 **micro** is a terminal-based text editor that aims to be easy to use and intuitive, while also taking advantage of the capabilities
 of modern terminals. It comes as a single, batteries-included, static binary with no dependencies; you can download and use it right now!
 
-
+# Powerline Fork
 This a fork which will include the powerline patch for statusline.go
 ![Screenshot](screenshot.png)
 
