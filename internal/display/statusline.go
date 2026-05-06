@@ -1,7 +1,14 @@
+// patched internal/display/statusline.go
+// Drop this file into micro/internal/display/ and run: go build ./...
+//
+// Changes vs upstream master:
+//   - Add $(#colorname) style-switch directive to the format string grammar.
+//   - Replace the flat []byte rendering pass with a span-based pipeline so
+//     each segment can carry its own tcell.Style.
+//   - Backward-compatible: format strings without $(#...) behave identically.
 package display
 
 import (
-	"bytes"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -15,6 +22,7 @@ import (
 	ulua "github.com/micro-editor/micro/v2/internal/lua"
 	"github.com/micro-editor/micro/v2/internal/screen"
 	"github.com/micro-editor/micro/v2/internal/util"
+	"github.com/micro-editor/tcell/v2"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -26,6 +34,55 @@ type StatusLine struct {
 	Info map[string]func(*buffer.Buffer) string
 
 	win *BufWindow
+}
+
+// statusSpan is a run of resolved text that shares a single tcell style.
+type statusSpan struct {
+	text  string
+	style tcell.Style
+}
+
+// spanIterator walks a []statusSpan, yielding one decoded rune at a time along
+// with its combining runes and the style of the span it came from.
+type spanIterator struct {
+	spans   []statusSpan
+	spanIdx int
+	data    []byte
+}
+
+func newSpanIterator(spans []statusSpan) *spanIterator {
+	it := &spanIterator{spans: spans}
+	if len(spans) > 0 {
+		it.data = []byte(spans[0].text)
+	}
+	return it
+}
+
+// Next returns the next rune, its combining runes, and its style.
+// ok is false when the iterator is exhausted.
+func (it *spanIterator) Next() (r rune, combc []rune, style tcell.Style, ok bool) {
+	for it.spanIdx < len(it.spans) {
+		if len(it.data) > 0 {
+			r, combc, size := util.DecodeCharacter(it.data)
+			it.data = it.data[size:]
+			return r, combc, it.spans[it.spanIdx].style, true
+		}
+		it.spanIdx++
+		if it.spanIdx < len(it.spans) {
+			it.data = []byte(it.spans[it.spanIdx].text)
+		}
+	}
+	return 0, nil, config.DefStyle, false
+}
+
+// calcSpansWidth returns the total terminal display-column width of a span slice.
+func calcSpansWidth(spans []statusSpan) int {
+	total := 0
+	for _, sp := range spans {
+		b := []byte(sp.text)
+		total += util.StringWidth(b, util.CharacterCount(b), 1)
+	}
+	return total
 }
 
 var statusInfo = map[string]func(*buffer.Buffer) string{
@@ -105,15 +162,96 @@ func (s *StatusLine) FindOpt(opt string) any {
 
 var formatParser = regexp.MustCompile(`\$\(.+?\)`)
 
+// resolveFormat expands a statusline format string into a slice of styled text
+// spans. Standard $(token) placeholders are supported as before. The new
+// $(#colorname) directive switches the active render style to
+// config.Colorscheme[colorname] for all subsequent text. $(#) resets to
+// baseStyle. Unrecognised colornames are silently ignored (style unchanged).
+func (s *StatusLine) resolveFormat(format string, baseStyle tcell.Style) []statusSpan {
+	var spans []statusSpan
+	currentStyle := baseStyle
+
+	// appendText adds text under the current style, merging into the last span
+	// when its style matches to avoid unnecessary allocations.
+	appendText := func(text string) {
+		if text == "" {
+			return
+		}
+		if len(spans) > 0 && spans[len(spans)-1].style == currentStyle {
+			spans[len(spans)-1].text += text
+		} else {
+			spans = append(spans, statusSpan{text: text, style: currentStyle})
+		}
+	}
+
+	indices := formatParser.FindAllStringIndex(format, -1)
+	prevEnd := 0
+
+	for _, idx := range indices {
+		start, end := idx[0], idx[1]
+
+		// Literal text that precedes this token
+		if start > prevEnd {
+			appendText(format[prevEnd:start])
+		}
+
+		token := format[start+2 : end-1] // strip "$(" prefix and ")" suffix
+
+		switch {
+		case strings.HasPrefix(token, "#"):
+			// Style-switch directive — emits no text.
+			name := token[1:]
+			if name == "" {
+				currentStyle = baseStyle
+			} else if style, ok := config.Colorscheme[name]; ok {
+				currentStyle = style
+			}
+			// Unknown names are intentionally ignored so typos don't crash.
+
+		case strings.HasPrefix(token, "opt:"):
+			appendText(fmt.Sprint(s.FindOpt(token[4:])))
+
+		case strings.HasPrefix(token, "bind:"):
+			binding := token[5:]
+			found := false
+			for k, v := range config.Bindings["buffer"] {
+				if v == binding {
+					appendText(k)
+					found = true
+					break
+				}
+			}
+			if !found {
+				appendText("null")
+			}
+
+		default:
+			if fn, ok := statusInfo[token]; ok {
+				appendText(fn(s.win.Buf))
+			}
+		}
+
+		prevEnd = end
+	}
+
+	// Trailing literal text after the last token
+	if prevEnd < len(format) {
+		appendText(format[prevEnd:])
+	}
+
+	return spans
+}
+
 // Display draws the statusline to the screen
 func (s *StatusLine) Display() {
-	// We'll draw the line at the lowest line in the window
+	// Draw at the lowest row of the window
 	y := s.win.Height + s.win.Y - 1
 
 	winX := s.win.X
 
 	b := s.win.Buf
-	// autocomplete suggestions (for the buffer, not for the infowindow)
+
+	// Autocomplete suggestions (for the buffer, not for the info window)
 	if b.HasSuggestions && len(b.Suggestions) > 1 {
 		statusLineStyle := config.DefStyle.Reverse(true)
 		if style, ok := config.Colorscheme["statusline.suggestions"]; ok {
@@ -148,52 +286,32 @@ func (s *StatusLine) Display() {
 		return
 	}
 
-	formatter := func(match []byte) []byte {
-		name := match[2 : len(match)-1]
-		if bytes.HasPrefix(name, []byte("opt")) {
-			option := name[4:]
-			return fmt.Append(nil, s.FindOpt(string(option)))
-		} else if bytes.HasPrefix(name, []byte("bind")) {
-			binding := string(name[5:])
-			for k, v := range config.Bindings["buffer"] {
-				if v == binding {
-					return []byte(k)
-				}
-			}
-			return []byte("null")
-		} else {
-			if fn, ok := statusInfo[string(name)]; ok {
-				return []byte(fn(s.win.Buf))
-			}
-			return []byte{}
-		}
-	}
-
-	leftText := []byte(s.win.Buf.Settings["statusformatl"].(string))
-	leftText = formatParser.ReplaceAllFunc(leftText, formatter)
-	rightText := []byte(s.win.Buf.Settings["statusformatr"].(string))
-	rightText = formatParser.ReplaceAllFunc(rightText, formatter)
-
-	statusLineStyle := config.DefStyle.Reverse(true)
+	// Determine the base style for the active or inactive window.
+	baseStyle := config.DefStyle.Reverse(true)
 	if s.win.IsActive() {
 		if style, ok := config.Colorscheme["statusline"]; ok {
-			statusLineStyle = style
+			baseStyle = style
 		}
 	} else {
 		if style, ok := config.Colorscheme["statusline.inactive"]; ok {
-			statusLineStyle = style
+			baseStyle = style
 		} else if style, ok := config.Colorscheme["statusline"]; ok {
-			statusLineStyle = style
+			baseStyle = style
 		}
 	}
 
-	leftLen := util.StringWidth(leftText, util.CharacterCount(leftText), 1)
-	rightLen := util.StringWidth(rightText, util.CharacterCount(rightText), 1)
+	leftSpans := s.resolveFormat(b.Settings["statusformatl"].(string), baseStyle)
+	rightSpans := s.resolveFormat(b.Settings["statusformatr"].(string), baseStyle)
+
+	leftLen := calcSpansWidth(leftSpans)
+	rightLen := calcSpansWidth(rightSpans)
+
+	leftIt := newSpanIterator(leftSpans)
+	rightIt := newSpanIterator(rightSpans)
 
 	for x := 0; x < s.win.Width; x++ {
 		if x < leftLen {
-			r, combc, size := util.DecodeCharacter(leftText)
-			leftText = leftText[size:]
+			r, combc, style, _ := leftIt.Next()
 			rw := runewidth.RuneWidth(r)
 			for j := 0; j < rw; j++ {
 				c := r
@@ -202,11 +320,10 @@ func (s *StatusLine) Display() {
 					combc = nil
 					x++
 				}
-				screen.SetContent(winX+x, y, c, combc, statusLineStyle)
+				screen.SetContent(winX+x, y, c, combc, style)
 			}
 		} else if x >= s.win.Width-rightLen && x < rightLen+s.win.Width-rightLen {
-			r, combc, size := util.DecodeCharacter(rightText)
-			rightText = rightText[size:]
+			r, combc, style, _ := rightIt.Next()
 			rw := runewidth.RuneWidth(r)
 			for j := 0; j < rw; j++ {
 				c := r
@@ -215,10 +332,10 @@ func (s *StatusLine) Display() {
 					combc = nil
 					x++
 				}
-				screen.SetContent(winX+x, y, c, combc, statusLineStyle)
+				screen.SetContent(winX+x, y, c, combc, style)
 			}
 		} else {
-			screen.SetContent(winX+x, y, ' ', nil, statusLineStyle)
+			screen.SetContent(winX+x, y, ' ', nil, baseStyle)
 		}
 	}
 }
